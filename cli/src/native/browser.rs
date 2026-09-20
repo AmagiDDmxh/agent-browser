@@ -448,6 +448,8 @@ const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const FAILED_INITIALIZATION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const MEMORY_MAINTENANCE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_BROWSER_OBJECT_GROUPS: [&str; 2] = ["agent-browser", "agent-browser-annotate"];
 
 impl BrowserManager {
     /// True when a *default* idle timeout must not close this browser:
@@ -1359,6 +1361,96 @@ impl BrowserManager {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
         }
+    }
+
+    /// Release remote objects owned by agent-browser and ask a locally
+    /// launched headless Chrome to perform a low-level JavaScript purge.
+    ///
+    /// This deliberately excludes attached and headed browsers: those may be
+    /// shared with a human or another client, so automatic memory maintenance
+    /// must not change their runtime state. Unsupported CDP domains are
+    /// treated as a normal no-op and fall back to HeapProfiler when possible.
+    pub async fn maintain_memory(&self) -> bool {
+        if !self.headless
+            || !matches!(
+                self.browser_process.as_ref(),
+                Some(BrowserProcess::Chrome(_))
+            )
+        {
+            return false;
+        }
+
+        let sessions: Vec<String> = self
+            .pages
+            .iter()
+            .map(|page| page.session_id.clone())
+            .filter(|session_id| !session_id.is_empty())
+            .collect();
+        if sessions.is_empty() {
+            return false;
+        }
+
+        let mut maintained = false;
+        for object_group in AGENT_BROWSER_OBJECT_GROUPS {
+            for session_id in &sessions {
+                let result = tokio::time::timeout(
+                    MEMORY_MAINTENANCE_COMMAND_TIMEOUT,
+                    self.client.send_command(
+                        "Runtime.releaseObjectGroup",
+                        Some(json!({ "objectGroup": object_group })),
+                        Some(session_id.as_str()),
+                    ),
+                )
+                .await;
+                if matches!(result, Ok(Ok(_))) {
+                    maintained = true;
+                }
+            }
+        }
+
+        let browser_purge = tokio::time::timeout(
+            MEMORY_MAINTENANCE_COMMAND_TIMEOUT,
+            self.client
+                .send_command_no_params("Memory.forciblyPurgeJavaScriptMemory", None),
+        )
+        .await;
+        let mut purge_succeeded = matches!(browser_purge, Ok(Ok(_)));
+
+        if !purge_succeeded {
+            for session_id in &sessions {
+                let result = tokio::time::timeout(
+                    MEMORY_MAINTENANCE_COMMAND_TIMEOUT,
+                    self.client.send_command_no_params(
+                        "Memory.forciblyPurgeJavaScriptMemory",
+                        Some(session_id.as_str()),
+                    ),
+                )
+                .await;
+                if matches!(result, Ok(Ok(_))) {
+                    purge_succeeded = true;
+                    break;
+                }
+            }
+        }
+
+        if !purge_succeeded {
+            for session_id in &sessions {
+                let result = tokio::time::timeout(
+                    MEMORY_MAINTENANCE_COMMAND_TIMEOUT,
+                    self.client.send_command_no_params(
+                        "HeapProfiler.collectGarbage",
+                        Some(session_id.as_str()),
+                    ),
+                )
+                .await;
+                if matches!(result, Ok(Ok(_))) {
+                    purge_succeeded = true;
+                    break;
+                }
+            }
+        }
+
+        maintained || purge_succeeded
     }
 
     /// Non-blocking check whether the locally-launched browser process has exited

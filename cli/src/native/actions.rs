@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -62,6 +62,9 @@ const AUTH_LOGIN_SELECTOR_POLL_INTERVAL_MS: u64 = 100;
 /// Time spent trying targeted username selectors before broad text-input
 /// fallback selectors are allowed.
 const AUTH_LOGIN_PREFERRED_SELECTOR_WINDOW_MS: u64 = 5_000;
+const MEMORY_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const MEMORY_MAINTENANCE_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+const MEMORY_MAINTENANCE_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const AUTH_LOGIN_NO_NAVIGATE_PAGE_ERROR: &str = "auth login --no-navigate requires an existing active HTTP(S) browser page; open the login page first";
 
@@ -143,6 +146,94 @@ impl HarContentMode {
 const HAR_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// Total budget for embedded bodies across one recording session.
 const HAR_MAX_TOTAL_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Request tracking is a diagnostic view, so retain a recent bounded window
+/// instead of allowing a long-lived daemon to grow with every network event.
+const REQUEST_TRACKING_MAX_ENTRIES: usize = 2_048;
+const REQUEST_TRACKING_MAX_URL_BYTES: usize = 16 * 1024;
+const REQUEST_TRACKING_MAX_POST_DATA_BYTES: usize = 64 * 1024;
+const REQUEST_TRACKING_MAX_HEADERS_BYTES: usize = 32 * 1024;
+const TRUNCATION_SUFFIX: &str = "...[truncated]";
+
+fn truncate_tracked_string(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= TRUNCATION_SUFFIX.len() {
+        let mut end = 0;
+        for (index, character) in value.char_indices() {
+            let next = index + character.len_utf8();
+            if next > max_bytes {
+                break;
+            }
+            end = next;
+        }
+        return value[..end].to_string();
+    }
+    let mut end = max_bytes - TRUNCATION_SUFFIX.len();
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = value[..end].to_string();
+    result.push_str(TRUNCATION_SUFFIX);
+    result
+}
+
+fn bound_tracked_headers(value: Value) -> Value {
+    let Value::Object(headers) = value else {
+        let serialized_len = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(REQUEST_TRACKING_MAX_HEADERS_BYTES + 1);
+        return if serialized_len <= REQUEST_TRACKING_MAX_HEADERS_BYTES {
+            value
+        } else {
+            json!({ "_agent_browser_truncated": true })
+        };
+    };
+
+    let mut bounded = serde_json::Map::new();
+    let mut used_bytes = 2usize;
+    let mut truncated = false;
+
+    for (key, value) in headers {
+        let key = truncate_tracked_string(&key, 1024);
+        let value = match value {
+            Value::String(value) => {
+                let bounded = truncate_tracked_string(&value, 4096);
+                if bounded.len() < value.len() {
+                    truncated = true;
+                }
+                Value::String(bounded)
+            }
+            other => {
+                let serialized_len = serde_json::to_vec(&other)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(REQUEST_TRACKING_MAX_HEADERS_BYTES + 1);
+                if serialized_len > 4096 {
+                    truncated = true;
+                    Value::String("[truncated]".to_string())
+                } else {
+                    other
+                }
+            }
+        };
+        let value_bytes = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let entry_bytes = key.len().saturating_add(value_bytes).saturating_add(4);
+        if used_bytes.saturating_add(entry_bytes) > REQUEST_TRACKING_MAX_HEADERS_BYTES {
+            truncated = true;
+            break;
+        }
+        used_bytes = used_bytes.saturating_add(entry_bytes);
+        bounded.insert(key, value);
+    }
+
+    if truncated {
+        bounded.insert("_agent_browser_truncated".to_string(), Value::Bool(true));
+    }
+    Value::Object(bounded)
+}
 
 pub struct RouteEntry {
     pub url_pattern: String,
@@ -565,6 +656,8 @@ pub struct DaemonState {
     /// When session state was last saved or a periodic autosave last failed,
     /// used to enforce the minimum interval between periodic saves.
     pub last_autosave_attempt: Option<std::time::Instant>,
+    /// Last low-frequency remote-object/V8 memory maintenance attempt.
+    pub last_memory_maintenance: Option<std::time::Instant>,
     pub session_id: String,
     pub tracing_state: TracingState,
     pub recording_state: RecordingState,
@@ -584,8 +677,11 @@ pub struct DaemonState {
     pub confirm_actions: Option<ConfirmActions>,
     pub inspect_server: Option<InspectServer>,
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
-    pub tracked_requests: Vec<TrackedRequest>,
+    pub tracked_requests: VecDeque<TrackedRequest>,
     pub request_tracking: bool,
+    /// Whether `network requests` explicitly enabled tracking. Stream mode is
+    /// a separate source and is removed when the stream is disabled.
+    request_tracking_explicit: bool,
     pub active_frame_id: Option<String>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
@@ -716,6 +812,7 @@ impl DaemonState {
             restore_saved_path: None,
             last_command_finished: None,
             last_autosave_attempt: None,
+            last_memory_maintenance: None,
             session_id,
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
@@ -732,8 +829,9 @@ impl DaemonState {
             confirm_actions: ConfirmActions::from_env(),
             inspect_server: None,
             routes: Arc::new(RwLock::new(Vec::new())),
-            tracked_requests: Vec::new(),
+            tracked_requests: VecDeque::new(),
             request_tracking: false,
+            request_tracking_explicit: false,
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
@@ -788,6 +886,44 @@ impl DaemonState {
         )
     }
 
+    /// Run memory maintenance only during a quiet period. A full V8 purge can
+    /// briefly pause a renderer, so active recording, screencasting, and HAR
+    /// capture defer it until the next interval.
+    pub(crate) async fn maybe_maintain_browser_memory(&mut self) {
+        let now = std::time::Instant::now();
+        if self
+            .last_memory_maintenance
+            .is_some_and(|last| last.elapsed() < MEMORY_MAINTENANCE_INTERVAL)
+        {
+            return;
+        }
+        if self
+            .last_command_finished
+            .is_none_or(|last| last.elapsed() < MEMORY_MAINTENANCE_QUIET_PERIOD)
+        {
+            return;
+        }
+        if self.recording_state.active || self.screencasting || self.har_recording {
+            return;
+        }
+
+        if let Some(server) = self.stream_server.as_ref() {
+            if server.is_screencasting().await {
+                return;
+            }
+        }
+
+        if self.browser.is_none() {
+            return;
+        }
+        self.last_memory_maintenance = Some(now);
+        if let Some(browser) = self.browser.as_ref() {
+            let _ =
+                tokio::time::timeout(MEMORY_MAINTENANCE_TOTAL_TIMEOUT, browser.maintain_memory())
+                    .await;
+        }
+    }
+
     /// Extract the timeout from a command JSON, falling back to the
     /// configured `default_timeout_ms` (from `AGENT_BROWSER_DEFAULT_TIMEOUT`).
     /// All wait-family handlers should use this instead of reading the
@@ -810,13 +946,15 @@ impl DaemonState {
         idle_activity: Arc<IdleActivity>,
     ) -> Self {
         let mut s = Self::new();
-        if stream_server.is_some() {
-            s.request_tracking = true;
-        }
         s.stream_client = stream_client;
         s.stream_server = stream_server;
+        s.refresh_request_tracking();
         s.idle_activity = idle_activity;
         s
+    }
+
+    fn refresh_request_tracking(&mut self) {
+        self.request_tracking = self.request_tracking_explicit || self.stream_server.is_some();
     }
 
     fn subscribe_to_browser_events(&mut self) {
@@ -1949,8 +2087,9 @@ impl DaemonState {
                                     });
                                 }
                                 if self.request_tracking {
-                                    let headers =
-                                        request.get("headers").cloned().unwrap_or(json!({}));
+                                    let headers = bound_tracked_headers(
+                                        request.get("headers").cloned().unwrap_or(json!({})),
+                                    );
                                     let resource_type = event
                                         .params
                                         .get("type")
@@ -1961,8 +2100,16 @@ impl DaemonState {
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_millis() as u64)
                                         .unwrap_or(0);
-                                    self.tracked_requests.push(TrackedRequest {
-                                        url,
+                                    while self.tracked_requests.len()
+                                        >= REQUEST_TRACKING_MAX_ENTRIES
+                                    {
+                                        self.tracked_requests.pop_front();
+                                    }
+                                    self.tracked_requests.push_back(TrackedRequest {
+                                        url: truncate_tracked_string(
+                                            &url,
+                                            REQUEST_TRACKING_MAX_URL_BYTES,
+                                        ),
                                         method,
                                         headers,
                                         timestamp,
@@ -1971,7 +2118,12 @@ impl DaemonState {
                                         post_data: request
                                             .get("postData")
                                             .and_then(|v| v.as_str())
-                                            .map(String::from),
+                                            .map(|value| {
+                                                truncate_tracked_string(
+                                                    value,
+                                                    REQUEST_TRACKING_MAX_POST_DATA_BYTES,
+                                                )
+                                            }),
                                         status: None,
                                         response_headers: None,
                                         mime_type: None,
@@ -2033,7 +2185,8 @@ impl DaemonState {
                                     }
                                 }
                                 if self.request_tracking {
-                                    let resp_headers = response.get("headers").cloned();
+                                    let resp_headers =
+                                        response.get("headers").cloned().map(bound_tracked_headers);
                                     let resp_mime = response
                                         .get("mimeType")
                                         .and_then(|v| v.as_str())
@@ -9131,7 +9284,7 @@ async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Va
 
     state.stream_client = Some(client_slot);
     state.stream_server = Some(Arc::new(server));
-    state.request_tracking = true;
+    state.refresh_request_tracking();
     state.refresh_active_iframe_sessions().await;
     if state.screencasting {
         if let Some(ref server) = state.stream_server {
@@ -9151,6 +9304,7 @@ async fn handle_stream_disable(state: &mut DaemonState) -> Result<Value, String>
     server.shutdown().await;
     state.stream_server = None;
     state.stream_client = None;
+    state.refresh_request_tracking();
     remove_stream_file(&state.session_id)?;
     remove_engine_file(&state.session_id);
     remove_provider_file(&state.session_id);
@@ -11932,8 +12086,10 @@ async fn handle_requests(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         return Ok(json!({ "cleared": true }));
     }
 
-    if !state.request_tracking {
-        state.request_tracking = true;
+    let was_tracking = state.request_tracking;
+    state.request_tracking_explicit = true;
+    state.refresh_request_tracking();
+    if !was_tracking {
         state.refresh_active_iframe_sessions().await;
         if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
@@ -13389,6 +13545,22 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tracked_request_metadata_is_bounded_without_breaking_utf8() {
+        let input = "界".repeat(20_000);
+        let truncated = super::truncate_tracked_string(&input, 128);
+        assert!(truncated.len() <= 128);
+        assert!(truncated.ends_with(super::TRUNCATION_SUFFIX));
+
+        let headers = super::bound_tracked_headers(serde_json::json!({
+            "x-large": "a".repeat(100_000),
+            "x-small": "ok"
+        }));
+        let encoded = serde_json::to_vec(&headers).unwrap();
+        assert!(encoded.len() <= super::REQUEST_TRACKING_MAX_HEADERS_BYTES + 64);
+        assert_eq!(headers["_agent_browser_truncated"], true);
+    }
+
     #[tokio::test]
     async fn human_command_does_not_change_session_default() {
         let mut state = super::DaemonState::new();
@@ -15163,6 +15335,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(enabled_status["enabled"], true);
         assert_eq!(enabled_status["connected"], false);
         assert_eq!(enabled_status["screencasting"], false);
+        assert!(state.request_tracking);
 
         let stream_path = socket_dir.join("stream-runtime-session.stream");
         let port_file =
@@ -15190,6 +15363,25 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         );
         assert!(state.stream_server.is_none());
         assert!(state.stream_client.is_none());
+        assert!(
+            !state.request_tracking,
+            "stream-only request tracking should stop with the stream"
+        );
+
+        handle_stream_enable(&json!({ "port": 0 }), &mut state)
+            .await
+            .expect("stream should be reusable after disable");
+        handle_requests(&json!({}), &mut state)
+            .await
+            .expect("network requests should enable explicit tracking");
+        assert!(state.request_tracking);
+        handle_stream_disable(&mut state)
+            .await
+            .expect("second stream disable should succeed");
+        assert!(
+            state.request_tracking,
+            "explicit request tracking should outlive stream shutdown"
+        );
 
         let final_status = handle_stream_status(&state)
             .await

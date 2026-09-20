@@ -1,16 +1,136 @@
 #[cfg(windows)]
 use super::windows_process::Child;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::VecDeque;
+use std::io::{BufReader, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
 use crate::ca_bundle::CaBundle;
+
+const CHROME_STDERR_MAX_LINES: usize = 128;
+const CHROME_STDERR_MAX_LINE_BYTES: usize = 8 * 1024;
+const DEVTOOLS_LISTENING_PREFIX: &str = "DevTools listening on ";
+
+#[derive(Default)]
+struct ChromeStderrState {
+    lines: VecDeque<String>,
+    ws_url: Option<String>,
+}
+
+/// Chrome's stderr must be drained for the entire process lifetime. Keeping a
+/// small tail also preserves useful launch diagnostics without retaining an
+/// unbounded log in the daemon.
+struct ChromeStderrCapture {
+    state: Mutex<ChromeStderrState>,
+    reader_done: AtomicBool,
+}
+
+impl ChromeStderrCapture {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ChromeStderrState::default()),
+            reader_done: AtomicBool::new(false),
+        }
+    }
+
+    fn record(&self, bytes: &[u8]) {
+        let mut line = String::from_utf8_lossy(bytes)
+            .trim_end_matches('\r')
+            .to_string();
+        if line.len() > CHROME_STDERR_MAX_LINE_BYTES {
+            let mut end = CHROME_STDERR_MAX_LINE_BYTES;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+            line.push_str(" ...[truncated]");
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(url) = line.strip_prefix(DEVTOOLS_LISTENING_PREFIX) {
+            state.ws_url = Some(url.trim().to_string());
+        }
+        if state.lines.len() >= CHROME_STDERR_MAX_LINES {
+            state.lines.pop_front();
+        }
+        state.lines.push_back(line);
+    }
+
+    fn ws_url(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .ws_url
+            .clone()
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lines
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn wait_for_reader(&self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.reader_done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn start_chrome_stderr_drain<R>(stderr: R) -> Result<Arc<ChromeStderrCapture>, String>
+where
+    R: Read + Send + 'static,
+{
+    let capture = Arc::new(ChromeStderrCapture::new());
+    let thread_capture = capture.clone();
+    std::thread::Builder::new()
+        .name("agent-browser-chrome-stderr".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut chunk = [0u8; 4096];
+            let mut line = Vec::with_capacity(CHROME_STDERR_MAX_LINE_BYTES + 1);
+
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        for byte in &chunk[..read] {
+                            if *byte == b'\n' {
+                                thread_capture.record(&line);
+                                line.clear();
+                            } else if line.len() <= CHROME_STDERR_MAX_LINE_BYTES {
+                                line.push(*byte);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if !line.is_empty() {
+                thread_capture.record(&line);
+            }
+            thread_capture.reader_done.store(true, Ordering::Release);
+        })
+        .map_err(|error| format!("Failed to start Chrome stderr drain: {}", error))?;
+
+    Ok(capture)
+}
 
 pub struct ChromeProcess {
     child: Child,
@@ -875,33 +995,40 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
     })?;
 
-    // Shared overall deadline so we don't double-wait (poll + stderr fallback).
+    let stderr = child.stderr.take().ok_or_else(|| {
+        terminate_launched_chrome(&mut child);
+        cleanup_temp_dir(&temp_user_data_dir);
+        "Failed to capture Chrome stderr".to_string()
+    })?;
+    let stderr_capture = match start_chrome_stderr_drain(stderr) {
+        Ok(capture) => capture,
+        Err(error) => {
+            terminate_launched_chrome(&mut child);
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(error);
+        }
+    };
+
+    // Shared overall deadline while the active-port file and stderr are both
+    // considered. The stderr reader stays alive for the complete Chrome
+    // process lifetime so a noisy renderer cannot block on a full pipe.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
     // Primary path: use DevToolsActivePort written into user-data-dir.
     // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
     // which can be missing/empty depending on how Chrome is launched.
-    let ws_url = match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
+    let ws_url = match wait_for_devtools_active_port(
+        &mut child,
+        &user_data_dir,
+        deadline,
+        &stderr_capture,
+    ) {
         Ok(url) => url,
         Err(primary_err) => {
-            // Fallback: scrape stderr (legacy behavior) for better diagnostics.
-            let stderr = child.stderr.take().ok_or_else(|| {
-                terminate_launched_chrome(&mut child);
-                cleanup_temp_dir(&temp_user_data_dir);
-                "Failed to capture Chrome stderr".to_string()
-            })?;
-            let reader = BufReader::new(stderr);
-            match wait_for_ws_url_until(reader, deadline) {
-                Ok(url) => url,
-                Err(fallback_err) => {
-                    terminate_launched_chrome(&mut child);
-                    cleanup_temp_dir(&temp_user_data_dir);
-                    return Err(format!(
-                        "{}\n(also tried parsing stderr) {}",
-                        primary_err, fallback_err
-                    ));
-                }
-            }
+            terminate_launched_chrome(&mut child);
+            stderr_capture.wait_for_reader(Duration::from_millis(100));
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err(chrome_launch_error(&primary_err, &stderr_capture.lines()));
         }
     };
 
@@ -929,10 +1056,15 @@ fn wait_for_devtools_active_port(
     child: &mut Child,
     user_data_dir: &Path,
     deadline: std::time::Instant,
+    stderr_capture: &ChromeStderrCapture,
 ) -> Result<String, String> {
     let poll_interval = Duration::from_millis(50);
 
     while std::time::Instant::now() <= deadline {
+        if let Some(url) = stderr_capture.ws_url() {
+            return Ok(url);
+        }
+
         if let Ok(Some(status)) = child.try_wait() {
             // Chrome exited before writing DevToolsActivePort -- report the
             // exit code so the caller can surface it alongside stderr output.
@@ -955,33 +1087,6 @@ fn wait_for_devtools_active_port(
     }
 
     Err("Timeout waiting for DevToolsActivePort".to_string())
-}
-
-fn wait_for_ws_url_until(
-    reader: impl BufRead,
-    deadline: std::time::Instant,
-) -> Result<String, String> {
-    let prefix = "DevTools listening on ";
-    let mut stderr_lines: Vec<String> = Vec::new();
-
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
-            return Err(chrome_launch_error(
-                "Timeout waiting for Chrome DevTools URL",
-                &stderr_lines,
-            ));
-        }
-        let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
-        if let Some(url) = line.strip_prefix(prefix) {
-            return Ok(url.trim().to_string());
-        }
-        stderr_lines.push(line);
-    }
-
-    Err(chrome_launch_error(
-        "Chrome exited before providing DevTools URL",
-        &stderr_lines,
-    ))
 }
 
 fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
@@ -1775,6 +1880,34 @@ fn expand_tilde(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
+
+    #[test]
+    fn chrome_stderr_drain_keeps_bounded_tail_and_detects_devtools_url() {
+        let mut stderr =
+            String::from("DevTools listening on ws://127.0.0.1:9222/devtools/browser/test\n");
+        for index in 0..140 {
+            stderr.push_str(&format!("tail-{}\n", index));
+        }
+        let capture = start_chrome_stderr_drain(std::io::Cursor::new(stderr)).unwrap();
+        capture.wait_for_reader(Duration::from_secs(1));
+
+        assert_eq!(
+            capture.ws_url().as_deref(),
+            Some("ws://127.0.0.1:9222/devtools/browser/test")
+        );
+        let lines = capture.lines();
+        assert_eq!(lines.len(), CHROME_STDERR_MAX_LINES);
+        assert_eq!(lines.last().map(String::as_str), Some("tail-139"));
+    }
+
+    #[test]
+    fn chrome_stderr_capture_truncates_long_lines() {
+        let capture = ChromeStderrCapture::new();
+        capture.record(&vec![b'x'; CHROME_STDERR_MAX_LINE_BYTES + 128]);
+        let line = capture.lines().pop().unwrap();
+        assert!(line.len() <= CHROME_STDERR_MAX_LINE_BYTES + " ...[truncated]".len());
+        assert!(line.ends_with("...[truncated]"));
+    }
 
     #[test]
     fn test_dev_shm_capacity_threshold() {

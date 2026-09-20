@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use futures_util::FutureExt;
-use tokio::sync::{broadcast, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 
 use crate::native::cdp::client::CdpClient;
 use crate::native::cdp::types::CdpEvent;
@@ -93,6 +93,8 @@ async fn publish_url(
 struct CarriedEvents {
     client: Arc<CdpClient>,
     receiver: broadcast::Receiver<CdpEvent>,
+    screencast_session_id: Option<String>,
+    screencast_receiver: Option<mpsc::Receiver<CdpEvent>>,
     queued: VecDeque<CdpEvent>,
 }
 
@@ -101,6 +103,7 @@ struct CarriedEvents {
 /// must survive the restart.
 fn preserve_queued_non_frame_events(
     receiver: &mut broadcast::Receiver<CdpEvent>,
+    screencast_receiver: &mut Option<mpsc::Receiver<CdpEvent>>,
     queued: &mut VecDeque<CdpEvent>,
 ) {
     loop {
@@ -112,6 +115,54 @@ fn preserve_queued_non_frame_events(
                 break
             }
         }
+    }
+
+    if let Some(receiver) = screencast_receiver.as_mut() {
+        loop {
+            match receiver.try_recv() {
+                Ok(event) if event.method != "Page.screencastFrame" => queued.push_back(event),
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break
+                }
+            }
+        }
+    }
+}
+
+enum StreamEventError {
+    Lagged,
+    Closed,
+}
+
+async fn next_stream_event(
+    receiver: &mut broadcast::Receiver<CdpEvent>,
+    screencast_receiver: &mut Option<mpsc::Receiver<CdpEvent>>,
+    queued: &mut VecDeque<CdpEvent>,
+) -> Result<CdpEvent, StreamEventError> {
+    if let Some(event) = queued.pop_front() {
+        return Ok(event);
+    }
+
+    if let Some(screencast_receiver) = screencast_receiver.as_mut() {
+        tokio::select! {
+            event = receiver.recv() => event.map_err(|error| match error {
+                broadcast::error::RecvError::Lagged(_) => StreamEventError::Lagged,
+                broadcast::error::RecvError::Closed => StreamEventError::Closed,
+            }),
+            event = screencast_receiver.recv() => event.ok_or(StreamEventError::Closed),
+        }
+    } else {
+        receiver.recv().await.map_err(|error| match error {
+            broadcast::error::RecvError::Lagged(_) => StreamEventError::Lagged,
+            broadcast::error::RecvError::Closed => StreamEventError::Closed,
+        })
+    }
+}
+
+fn unsubscribe_carried_screencast(client: &Arc<CdpClient>, session_id: Option<&str>) {
+    if let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) {
+        client.unsubscribe_screencast_session(session_id);
     }
 }
 
@@ -145,6 +196,12 @@ pub(super) async fn cdp_event_loop(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
+                    if let Some(carried) = carried_events.take() {
+                        unsubscribe_carried_screencast(
+                            &carried.client,
+                            carried.screencast_session_id.as_deref(),
+                        );
+                    }
                     let session_id = cdp_session_id.read().await.clone();
                     if *screencasting.lock().await {
                         if let Some(ref client) = *client_slot.read().await {
@@ -166,16 +223,51 @@ pub(super) async fn cdp_event_loop(
 
         if count > 0 {
             if let Some(ref client) = *guard {
-                let (mut event_rx, mut queued_events) = match carried_events.take() {
-                    Some(carried) if Arc::ptr_eq(&carried.client, client) => {
-                        (carried.receiver, carried.queued)
-                    }
-                    _ => (client.subscribe(), VecDeque::new()),
-                };
                 let client_arc = Arc::clone(client);
                 drop(guard);
 
                 let session_id = cdp_session_id.read().await.clone();
+                let screencast_session_id = session_id
+                    .as_deref()
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(String::from);
+                let (mut event_rx, mut screencast_rx, mut queued_events) = match carried_events
+                    .take()
+                {
+                    Some(carried) if Arc::ptr_eq(&carried.client, &client_arc) => {
+                        let mut screencast_rx = carried.screencast_receiver;
+                        if carried.screencast_session_id != screencast_session_id {
+                            unsubscribe_carried_screencast(
+                                &carried.client,
+                                carried.screencast_session_id.as_deref(),
+                            );
+                            screencast_rx = screencast_session_id.as_deref().map(|session_id| {
+                                client_arc.subscribe_screencast_session(session_id)
+                            });
+                        }
+                        (carried.receiver, screencast_rx, carried.queued)
+                    }
+                    Some(carried) => {
+                        unsubscribe_carried_screencast(
+                            &carried.client,
+                            carried.screencast_session_id.as_deref(),
+                        );
+                        (
+                            client_arc.subscribe(),
+                            screencast_session_id.as_deref().map(|session_id| {
+                                client_arc.subscribe_screencast_session(session_id)
+                            }),
+                            VecDeque::new(),
+                        )
+                    }
+                    None => (
+                        client_arc.subscribe(),
+                        screencast_session_id
+                            .as_deref()
+                            .map(|session_id| client_arc.subscribe_screencast_session(session_id)),
+                        VecDeque::new(),
+                    ),
+                };
 
                 let vw = *viewport_width.lock().await;
                 let vh = *viewport_height.lock().await;
@@ -277,6 +369,10 @@ pub(super) async fn cdp_event_loop(
                                 }
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
+                                unsubscribe_carried_screencast(
+                                    &client_arc,
+                                    screencast_session_id.as_deref(),
+                                );
                                 return;
                             }
                         }
@@ -291,6 +387,10 @@ pub(super) async fn cdp_event_loop(
                                 }
                                 let mut sc = screencasting.lock().await;
                                 *sc = false;
+                                unsubscribe_carried_screencast(
+                                    &client_arc,
+                                    screencast_session_id.as_deref(),
+                                );
                                 break;
                             }
                             let client_changed = {
@@ -320,24 +420,39 @@ pub(super) async fn cdp_event_loop(
                                 if !client_changed {
                                     preserve_queued_non_frame_events(
                                         &mut event_rx,
+                                        &mut screencast_rx,
                                         &mut queued_events,
                                     );
+                                    // A restart always gets a fresh frame queue.
+                                    // Frames already in flight belong to the old
+                                    // screencast, even when only the viewport changed.
+                                    unsubscribe_carried_screencast(
+                                        &client_arc,
+                                        screencast_session_id.as_deref(),
+                                    );
+                                    screencast_rx = None;
                                     carried_events = Some(CarriedEvents {
                                         client: Arc::clone(&client_arc),
                                         receiver: event_rx,
+                                        screencast_session_id: None,
+                                        screencast_receiver: screencast_rx,
                                         queued: queued_events,
                                     });
+                                } else {
+                                    unsubscribe_carried_screencast(
+                                        &client_arc,
+                                        screencast_session_id.as_deref(),
+                                    );
                                 }
                                 client_notify.notify_one();
                                 break;
                             }
                         }
-                        event = async {
-                            match queued_events.pop_front() {
-                                Some(event) => Ok(event),
-                                None => event_rx.recv().await,
-                            }
-                        } => {
+                        event = next_stream_event(
+                            &mut event_rx,
+                            &mut screencast_rx,
+                            &mut queued_events,
+                        ) => {
                             match event {
                                 Ok(evt) => {
                                     if evt.method == "Page.frameNavigated" {
@@ -533,18 +648,34 @@ pub(super) async fn cdp_event_loop(
                                         let _ = frame_tx.send(msg.to_string());
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(StreamEventError::Lagged) => continue,
+                                Err(StreamEventError::Closed) => {
+                                    unsubscribe_carried_screencast(
+                                        &client_arc,
+                                        screencast_session_id.as_deref(),
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             } else {
-                carried_events = None;
+                if let Some(carried) = carried_events.take() {
+                    unsubscribe_carried_screencast(
+                        &carried.client,
+                        carried.screencast_session_id.as_deref(),
+                    );
+                }
                 drop(guard);
             }
         } else {
-            carried_events = None;
+            if let Some(carried) = carried_events.take() {
+                unsubscribe_carried_screencast(
+                    &carried.client,
+                    carried.screencast_session_id.as_deref(),
+                );
+            }
             let was_screencasting = *screencasting.lock().await;
             if was_screencasting {
                 if let Some(ref client) = *guard {

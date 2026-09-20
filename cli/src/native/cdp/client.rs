@@ -45,6 +45,24 @@ const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECTION_CLOSED_ERROR: &str = "CDP connection closed";
 
+// Keep transport memory bounded even when a page or a proxy sends malformed
+// or unusually large CDP payloads. These limits retain room for screenshots
+// and accessibility snapshots while preventing an unbounded websocket queue.
+const CDP_MAX_MESSAGE_SIZE: usize = 64 << 20;
+const CDP_MAX_FRAME_SIZE: usize = 16 << 20;
+const CDP_MAX_WRITE_BUFFER_SIZE: usize = 4 << 20;
+const CDP_EVENT_BUFFER_CAPACITY: usize = 256;
+const CDP_RAW_BUFFER_CAPACITY: usize = 64;
+
+fn cdp_websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(CDP_MAX_MESSAGE_SIZE),
+        max_frame_size: Some(CDP_MAX_FRAME_SIZE),
+        max_write_buffer_size: CDP_MAX_WRITE_BUFFER_SIZE,
+        ..Default::default()
+    }
+}
+
 fn normalize_websocket_root_path(url: &str) -> String {
     let Some(scheme_end) = url.find("://").map(|index| index + 3) else {
         return url.to_string();
@@ -163,6 +181,7 @@ pub struct CdpClient {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
+    screencast_sessions: PrivateSessions,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -217,13 +236,7 @@ impl CdpClient {
             }
         }
 
-        let ws_config = WebSocketConfig {
-            max_message_size: None,
-            max_frame_size: None,
-            ..Default::default()
-        };
-
-        Self::connect_request(request, ws_config, None).await
+        Self::connect_request(request, cdp_websocket_config(), None).await
     }
 
     async fn connect_request(
@@ -251,17 +264,19 @@ impl CdpClient {
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, _) = broadcast::channel(4096);
-        let (raw_tx, _) = broadcast::channel(4096);
+        let (event_tx, _) = broadcast::channel(CDP_EVENT_BUFFER_CAPACITY);
+        let (raw_tx, _) = broadcast::channel(CDP_RAW_BUFFER_CAPACITY);
         let closed = Arc::new(AtomicBool::new(false));
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let screencast_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
         let closed_reader = closed.clone();
         let private_clone = private_sessions.clone();
+        let screencast_clone = screencast_sessions.clone();
 
         // Notify used to stop the keepalive task when the reader loop exits.
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
@@ -358,17 +373,41 @@ impl CdpClient {
                         session_id: parsed.session_id.clone(),
                     };
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
+                        // Screencast frames are the largest and highest-volume CDP
+                        // events. Route them through their own small channel so a
+                        // stream consumer cannot fill the general event ring buffer.
+                        let mut routed = false;
+                        if event.method == "Page.screencastFrame" {
+                            let mut routes =
+                                screencast_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(tx) = routes.get(sid) {
+                                match tx.try_send(event.clone()) {
+                                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                                        routed = true;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        routes.remove(sid);
+                                    }
+                                }
+                            }
+                        }
+
+                        // A recording and the live stream can briefly observe
+                        // the same target. Deliver to both private consumers;
+                        // either one receiving (or dropping) the frame keeps it
+                        // out of the general broadcast queue.
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
-                        match routes.get(sid) {
-                            Some(tx) => match tx.try_send(event.clone()) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                        if let Some(tx) = routes.get(sid) {
+                            match tx.try_send(event.clone()) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                                    routed = true;
+                                }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     routes.remove(sid);
-                                    false
                                 }
-                            },
-                            None => false,
+                            }
                         }
+                        routed
                     });
                     if !routed {
                         let _ = event_tx_clone.send(event);
@@ -423,6 +462,7 @@ impl CdpClient {
             reader_handle: Mutex::new(Some(reader_handle)),
             keepalive_handle: Mutex::new(Some(keepalive_handle)),
             private_sessions,
+            screencast_sessions,
         })
     }
 
@@ -548,6 +588,26 @@ impl CdpClient {
 
     pub fn unsubscribe_session(&self, session_id: &str) {
         self.private_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+    }
+
+    /// Subscribe to only screencast frames for a session. Frames use a small,
+    /// lossy queue because the latest frame is more useful than replaying a
+    /// backlog, and keeping them out of the general event ring avoids retaining
+    /// many large base64 payloads there.
+    pub fn subscribe_screencast_session(&self, session_id: &str) -> mpsc::Receiver<CdpEvent> {
+        let (tx, rx) = mpsc::channel(PRIVATE_SESSION_BUFFER);
+        self.screencast_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.to_string(), tx);
+        rx
+    }
+
+    pub fn unsubscribe_screencast_session(&self, session_id: &str) {
+        self.screencast_sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id);
@@ -711,6 +771,15 @@ mod tests {
 
     const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
     const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";
+
+    #[test]
+    fn websocket_transport_limits_are_explicitly_bounded() {
+        let config = cdp_websocket_config();
+        assert_eq!(config.max_message_size, Some(CDP_MAX_MESSAGE_SIZE));
+        assert_eq!(config.max_frame_size, Some(CDP_MAX_FRAME_SIZE));
+        assert_eq!(config.max_write_buffer_size, CDP_MAX_WRITE_BUFFER_SIZE);
+        assert!(config.max_write_buffer_size > config.write_buffer_size);
+    }
 
     #[test]
     fn repairs_only_unpaired_surrogate_escapes() {
@@ -1052,11 +1121,7 @@ mod tests {
         let request = format!("wss://127.0.0.1:{port}")
             .into_client_request()
             .unwrap();
-        let config = WebSocketConfig {
-            max_message_size: None,
-            max_frame_size: None,
-            ..Default::default()
-        };
+        let config = cdp_websocket_config();
         let client =
             CdpClient::connect_request(request, config, Some(Connector::Rustls(client_config)))
                 .await
@@ -1144,6 +1209,8 @@ mod tests {
             ready_rx.await.unwrap();
             for (method, session) in [
                 ("Page.screencastFrame", Some("S-REC")),
+                ("Page.screencastFrame", Some("S-SC")),
+                ("Page.frameNavigated", Some("S-SC")),
                 ("Page.screencastFrame", Some("S-PAGE")),
                 ("Target.detachedFromTarget", None),
             ] {
@@ -1162,6 +1229,7 @@ mod tests {
             .unwrap();
         let mut broadcast_rx = client.subscribe();
         let mut private_rx = client.subscribe_session("S-REC");
+        let mut screencast_rx = client.subscribe_screencast_session("S-SC");
         ready_tx.send(()).unwrap();
 
         let wait = std::time::Duration::from_secs(2);
@@ -1169,24 +1237,39 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.session_id.as_deref(), Some("S-PAGE"));
+        assert_eq!(first.method, "Page.frameNavigated");
+        assert_eq!(first.session_id.as_deref(), Some("S-SC"));
         let second = tokio::time::timeout(wait, broadcast_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.method, "Target.detachedFromTarget");
+        assert_eq!(second.session_id.as_deref(), Some("S-PAGE"));
+        assert_eq!(second.method, "Page.screencastFrame");
+        let third = tokio::time::timeout(wait, broadcast_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.method, "Target.detachedFromTarget");
 
         let private = tokio::time::timeout(wait, private_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(private.session_id.as_deref(), Some("S-REC"));
+        assert_eq!(private.method, "Page.screencastFrame");
+        let screencast = tokio::time::timeout(wait, screencast_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(screencast.session_id.as_deref(), Some("S-SC"));
+        assert_eq!(screencast.method, "Page.screencastFrame");
         assert!(
             private_rx.try_recv().is_err(),
             "only S-REC events are routed privately"
         );
 
         client.unsubscribe_session("S-REC");
+        client.unsubscribe_screencast_session("S-SC");
         drop(client);
         server.abort();
     }

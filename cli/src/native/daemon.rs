@@ -295,6 +295,7 @@ async fn run_socket_server(
                         maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
                     }
                 }
+                s.maybe_maintain_browser_memory().await;
             }
             _ = async {
                 match idle_sleep_pin {
@@ -442,6 +443,7 @@ async fn run_socket_server(
                     s.drain_cdp_events_background().await;
                     maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
                 }
+                s.maybe_maintain_browser_memory().await;
             }
             _ = async {
                 match idle_sleep_pin {
