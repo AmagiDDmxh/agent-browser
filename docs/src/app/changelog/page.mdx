@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.38.2
+
+<p className="text-[#888] text-sm">September 24, 2026</p>
+
+### Improvements
+
+- Bounded request tracking, CDP event and screencast queues, and WebSocket buffers to keep long-running sessions from accumulating unbounded memory.
+- Added idle memory maintenance for locally launched headless Chrome, including agent-browser object-group release and JavaScript heap collection.
+
+### Bug Fixes
+
+- Continuously drain Chrome stderr and bound retained diagnostics so a full output pipe cannot block the browser process on Windows or macOS.
+
+---
+
 ## v0.38.1
 
 <p className="text-[#888] text-sm">September 16, 2026</p>

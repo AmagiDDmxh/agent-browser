@@ -1,8 +1,20 @@
 # agent-browser
 
-## 0.38.1
+## 0.38.2
 
 <!-- release:start -->
+### Improvements
+
+- Bounded request tracking, CDP event and screencast queues, and WebSocket buffers to keep long-running sessions from accumulating unbounded memory.
+- Added idle memory maintenance for locally launched headless Chrome, including agent-browser object-group release and JavaScript heap collection.
+
+### Bug Fixes
+
+- Continuously drain Chrome stderr and bound retained diagnostics so a full output pipe cannot block the browser process on Windows or macOS.
+<!-- release:end -->
+
+## 0.38.1
+
 ### Bug Fixes
 
 - Fixed **recording cursor and mouse movement timing** so cursor rendering stays synchronized with page content during drags and timed mouse moves (#1869)
@@ -15,8 +27,6 @@
 
 - @ctate
 - @Railly
-<!-- release:end -->
-
 ## 0.38.0
 
 ### New Features
