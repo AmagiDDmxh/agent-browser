@@ -13893,7 +13893,8 @@ mod tests {
                             }
                         }
                         "DOM.describeNode" if failure == "describe" && attempts == 1 => {
-                            response["error"] = json!({ "code": -32000, "message": "Node unavailable" });
+                            response["error"] =
+                                json!({ "code": -32000, "message": "Node unavailable" });
                             Value::Null
                         }
                         "DOM.describeNode" => json!({ "node": { "backendNodeId": 42 } }),
