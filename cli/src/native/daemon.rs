@@ -528,6 +528,7 @@ fn spawn_background_tick_if_idle(
                 maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
         }
+        state.maybe_maintain_browser_memory().await;
     });
     true
 }
